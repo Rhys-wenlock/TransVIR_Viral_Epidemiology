@@ -1,0 +1,1615 @@
+---
+title: "TransVIR respiratory virus epidemiology: analysis log"
+subtitle: "Incidence, shedding and transmission of common respiratory viruses, The Gambia, March 2021 – June 2022"
+author: "Rhys Wenlock, Sheikh Jarju"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+<!--
+Analysis log for:
+  * TransVIR_Respiratory_Virus_Epi_v1.3_02082026.docx   (main text: Tables 1-4, Figures 1-2)
+  * Supplementary_tables_V2_02082026.docx               (Tables S1-S11, Figures S1-S2)
+
+Sections follow the order of the Results in the manuscript. Supplementary table
+numbers follow the supplementary file.
+
+Outputs (CSV tables, PNG figures) are written to ./output/.
+-->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 9, fig.height = 6)
+
+library(tidyverse)
+library(lubridate)
+library(lme4)
+library(broom)
+library(broom.mixed)
+library(lmtest)
+library(survival)
+library(Epi)       # Lexis(), cal.yr()
+library(popEpi)    # rate()
+library(zoo)       # rollmean()
+library(knitr)
+library(kableExtra)
+
+# Print every data frame / tibble as a padded, striped HTML table.
+# Long tables scroll horizontally rather than squashing columns together.
+knit_print.data.frame <- function(x, ...) {
+  x <- as.data.frame(x) %>% mutate(across(where(is.double), ~ round(.x, 3)))
+  tab <- kbl(x, row.names = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left")
+  if (ncol(x) > 7) tab <- scroll_box(tab, width = "100%")
+  knitr::asis_output(tab)
+}
+registerS3method("knit_print", "data.frame", knit_print.data.frame)
+options(knitr.kable.NA = "")
+
+out_dir <- here::here("output")
+dir.create(out_dir, showWarnings = FALSE)
+```
+
+```{css, echo = FALSE}
+.main-container { max-width: 1500px; }
+table th, table td { padding: 4px 12px !important; }
+table td { white-space: nowrap; }
+table th { vertical-align: bottom !important; }
+```
+
+```{r constants-and-helpers}
+# ---- Analysis constants (all definitions in one place) ----------------------
+EPISODE_WINDOW   <- 28  # days: positives within 28d of episode start belong to the same episode
+CONSECUTIVE_GAP  <- 10  # days: beyond 28d, positives must be <=10d apart ("consecutive")
+SYMPTOM_WINDOW   <- 10  # days after first positive in which a symptomatic visit is attributed
+LONG_SHED_DAYS   <- 7   # duration > 7 days = shedding > 1 week
+TX_WINDOW        <- 14  # days: household exposure window after index positive
+TX_MAX_ROUNDS    <- 14  # number of sequential cluster rounds searched per household
+RESTRICT_PRIOR   <- 7   # days of at-risk time credited before each completed visit (S2/S8)
+RESTRICT_GAP     <- 10  # days allowed between visits for uninterrupted follow-up (S2/S8)
+STUDY_WEEKS      <- 52
+
+# ---- Virus labels ------------------------------------------------------------
+# Pooled groups used for incidence / shedding / symptoms
+virus_lookup <- tribble(
+  ~virus,    ~virus_proper,
+  "hrv",     "HRV",
+  "cov2",    "SARS-CoV-2",
+  "corona",  "Seasonal Coronaviruses",
+  "piv_any", "Parainfluenza Viruses",
+  "rsv_any", "RSV",
+  "adeno",   "Adenoviruses",
+  "hmpv",    "HMPV",
+  "flu_any", "Influenza"
+)
+virus_order <- virus_lookup$virus_proper  # Table 1 order
+
+# Species-level viruses used for the transmission analysis
+tx_lookup <- tribble(
+  ~tag,    ~pcr_col, ~tx_label,
+  "HRV",   "hrv",    "HRV",
+  "SCV",   "cov2",   "SARS-CoV-2",
+  "sea",   "corona", "Seasonal CoV",
+  "RSVA",  "rsva",   "RSV",
+  "adeno", "adeno",  "Adenovirus",
+  "hmpv",  "hmpv",   "HMPV",
+  "iav",   "iav",    "Influenza A",
+  "piv1",  "piv1",   "Parainfluenza 1",
+  "piv2",  "piv2",   "Parainfluenza 2",
+  "piv3",  "piv3",   "Parainfluenza 3",
+  "piv4",  "piv4",   "Parainfluenza 4"
+)
+
+color_vector <- c("HRV" = "#00A9FF", "Seasonal Coronaviruses" = "#CD9600",
+                  "SARS-CoV-2" = "#7CAE00", "RSV" = "#FF61CC",
+                  "Parainfluenza Viruses" = "#C77CFF", "Adenoviruses" = "#F8766D",
+                  "HMPV" = "#00BFC4", "Influenza" = "#00BE67")
+
+# ---- Formatting helpers --------------------------------------------------------
+fmt_est_ci <- function(est, lo, hi, digits = 2) {
+  sprintf(paste0("%.", digits, "f (%.", digits, "f - %.", digits, "f)"), est, lo, hi)
+}
+fmt_p <- function(p) {
+  case_when(is.na(p) ~ "", p < 0.0001 ~ "<0.0001", p < 0.001 ~ sprintf("%.4f", p),
+            p < 0.01 ~ sprintf("%.3f", p), TRUE ~ sprintf("%.2f", p))
+}
+cut_household <- function(x) {
+  cut(x, breaks = c(4, 7, 10, Inf), labels = c("5-7", "8-10", ">10"), right = TRUE)
+}
+
+# ---- Reported results -------------------------------------------------------------
+# add_result() records a headline number (e.g. swab counts, overall SAR) against the
+# current chunk; show_results() at the end of the chunk displays them as a table.
+results_log <- tibble(chunk = character(), Measure = character(), Value = character())
+add_result <- function(item, value) {
+  results_log <<- add_row(results_log, chunk = knitr::opts_current$get("label") %||% "",
+                          Measure = item, Value = as.character(value))
+  invisible(NULL)
+}
+show_results <- function() {
+  results_log %>% filter(chunk == (knitr::opts_current$get("label") %||% "")) %>% select(-chunk)
+}
+
+# Profile-likelihood CI for the intercept (as in the original code), with a
+# Wald fallback that is reported if profiling fails to converge.
+intercept_ci <- function(m) {
+  tryCatch(confint(m, parm = "(Intercept)", level = 0.95),
+           error = function(e) {
+             message("Profile CI failed (", conditionMessage(e), "); using Wald CI")
+             confint(m, parm = "(Intercept)", method = "Wald")
+           })
+}
+
+# Display labels for episode-level model tables (Tables 2, 3, S3, S4)
+episode_var_labels <- c(symp = "Symptoms", virus = "Virus", age_cat = "Age (years)", Sex = "Sex")
+episode_level_labels <- c("0" = "Asymptomatic", "1" = "Missing", "2" = "Symptomatic",
+                          set_names(virus_lookup$virus_proper, virus_lookup$virus))
+episode_level_order <- c("<5", "5-17", "18-49", ">50", virus_order,
+                         "Female", "Male", "Asymptomatic", "Missing", "Symptomatic")
+label_episode_table <- function(tab) {
+  tab %>%
+    mutate(Level = recode(Level, !!!episode_level_labels),
+           Variable = factor(Variable, levels = names(episode_var_labels), labels = episode_var_labels),
+           Level_ord = match(Level, episode_level_order)) %>%
+    arrange(Variable, Level_ord) %>%
+    group_by(Variable) %>%
+    mutate(`LRT p` = c(rep("", n() - 1), paste(`LRT p`, collapse = ""))) %>%
+    ungroup() %>%
+    select(-Level_ord)
+}
+
+# glmer with the original settings, with fallbacks for numerical failures.
+# Zero-event levels (e.g. HMPV/influenza with no long shedders) push coefficients
+# towards -Inf, which can make lme4 fail with "Downdated VtV is not positive
+# definite", either in the post-fit derivative check or during optimisation.
+# Fallbacks, tried in order (each reported in the knitted output):
+#   1. original control (bobyqa, with derivative check)
+#   2. bobyqa, derivative check off      -> same fit; SEs from RX not Hessian
+#   3. Nelder_Mead, derivative check off -> different optimiser, same MLE target
+#   4. nloptwrap, derivative check off
+# Fits from 2-4 should agree with 1 to rounding; CIs may differ in the 2nd decimal.
+glmer_fallbacks <- tibble(model = character(), fit_used = character())
+glmer_safe <- function(formula, data, family, control = glmerControl()) {
+  attempts <- list(
+    "original" = control,
+    "bobyqa, no derivs" = modifyList(control, list(calc.derivs = FALSE)),
+    "Nelder_Mead, no derivs" = glmerControl(optimizer = "Nelder_Mead", calc.derivs = FALSE,
+                                            optCtrl = list(maxfun = 1e5)),
+    "nloptwrap, no derivs" = glmerControl(optimizer = "nloptwrap", calc.derivs = FALSE)
+  )
+  errors <- character()
+  for (nm in names(attempts)) {
+    fit <- tryCatch(lme4::glmer(formula, data = data, family = family, control = attempts[[nm]]),
+                    error = function(e) { errors[[nm]] <<- conditionMessage(e); NULL })
+    if (!is.null(fit)) {
+      if (nm != "original") {
+        message("glmer fallback used (", nm, ") for: ", deparse1(formula))
+        glmer_fallbacks <<- add_row(glmer_fallbacks, model = deparse1(formula), fit_used = nm)
+      }
+      return(fit)
+    }
+  }
+  stop("All glmer attempts failed for ", deparse1(formula), ":\n",
+       paste(names(errors), errors, sep = ": ", collapse = "\n"))
+}
+
+# Fixed-effect Wald CIs for a glmer fit. lme4 computes SEs from a numerical
+# Hessian by default. With a zero-event level (e.g. influenza in Table S3) the
+# Hessian can be near-singular, giving infinite SEs for every correlated term
+# (CIs of 0.00 - Inf). If any estimable term (one with events) has an SE that is
+# non-finite or > 10 on the log-odds scale, the model's SEs are taken from the
+# RX approximation instead (vcov(use.hessian = FALSE)), and this is logged.
+fixef_ci <- function(m, zero_event_terms = character(), exponentiate = TRUE) {
+  b <- fixef(m)
+  se_h <- suppressWarnings(sqrt(diag(as.matrix(vcov(m)))))
+  check <- setdiff(names(b), zero_event_terms)
+  unstable <- any(!is.finite(se_h[check]) | se_h[check] > 10)
+  se <- if (unstable) sqrt(diag(as.matrix(vcov(m, use.hessian = FALSE)))) else se_h
+  if (unstable) {
+    f <- deparse1(formula(m))
+    message("Hessian-based SEs unstable; RX-based SEs used for: ", f)
+    glmer_fallbacks <<- add_row(glmer_fallbacks, model = f, fit_used = "SEs from RX (Hessian unstable)")
+  }
+  z <- qnorm(0.975)
+  out <- tibble(term = names(b), estimate = unname(b), std.error = unname(se),
+                conf.low = estimate - z * std.error, conf.high = estimate + z * std.error)
+  if (exponentiate) out <- mutate(out, across(c(estimate, conf.low, conf.high), exp))
+  out
+}
+
+# ---- Mixed-model table helper --------------------------------------------------------
+# Fits outcome ~ covariates + (1 | household_ID/pid), drops each covariate in turn
+# for a likelihood-ratio test, and returns a publication-style table with counts.
+# Used for Tables 2, 3, S3, S4, S11.
+#
+# Zero-event levels (e.g. no HMPV/influenza long shedders) have an MLE of -Inf.
+# If lme4 cannot fit the models at all, the table is refitted with the
+# "separated" episodes removed. As the coefficient -> -Inf those episodes are
+# predicted with certainty, so they contribute nothing to the likelihood: fitting
+# without them gives the limiting MLE for every other parameter, and the same
+# log-likelihood. LRTs are therefore computed from log-likelihoods with degrees of
+# freedom from the full model specification, which is valid in both cases.
+fit_episode_models <- function(data, outcome, covariates, re, drop_separated) {
+  ctrl <- glmerControl(optimizer = "bobyqa")
+  zero_levels <- map(set_names(covariates), function(v) {
+    ev <- tapply(data[[outcome]], as.character(data[[v]]), sum, na.rm = TRUE)
+    names(ev)[ev == 0]
+  })
+  n_fixed <- function(covs) ncol(model.matrix(as.formula(paste("~", paste(covs, collapse = " + "))), data))
+  fit_one <- function(covs) {
+    d <- data
+    if (drop_separated) {
+      for (v in covs) d <- d[!as.character(d[[v]]) %in% zero_levels[[v]], , drop = FALSE]
+      d <- droplevels(d)
+    }
+    f <- as.formula(paste(outcome, "~", paste(covs, collapse = " + "), "+", re))
+    glmer_safe(f, data = d, family = binomial(link = "logit"), control = ctrl)
+  }
+  full <- fit_one(covariates)
+  lrt_p <- map_dbl(set_names(covariates), function(v) {
+    red <- fit_one(setdiff(covariates, v))
+    stat <- 2 * (as.numeric(logLik(full)) - as.numeric(logLik(red)))
+    pchisq(stat, df = n_fixed(covariates) - n_fixed(setdiff(covariates, v)), lower.tail = FALSE)
+  })
+  zero_terms <- unlist(imap(zero_levels, ~ if (length(.x)) paste0(.y, .x)))
+  list(full = full, lrt_p = lrt_p, zero_terms = zero_terms)
+}
+
+episode_model_table <- function(data, outcome, covariates, re = "(1 | household_ID/pid)") {
+  fits <- tryCatch(fit_episode_models(data, outcome, covariates, re, drop_separated = FALSE),
+                   error = function(e) {
+                     message("Standard fit failed (", conditionMessage(e), ")\n",
+                             "Refitting ", outcome, " models without zero-event levels (limiting MLE).")
+                     glmer_fallbacks <<- add_row(glmer_fallbacks,
+                       model = paste(outcome, "~", paste(covariates, collapse = " + ")),
+                       fit_used = "zero-event levels removed (limiting MLE)")
+                     fit_episode_models(data, outcome, covariates, re, drop_separated = TRUE)
+                   })
+
+  counts <- map_dfr(covariates, function(v) {
+    data %>%
+      group_by(Level = as.character(.data[[v]])) %>%
+      summarise(N = n(),
+                n_outcome = sum(.data[[outcome]] == 1, na.rm = TRUE),
+                pct = round(100 * mean(.data[[outcome]] == 1, na.rm = TRUE), 1),
+                .groups = "drop") %>%
+      mutate(Variable = v, term = paste0(v, Level))
+  })
+
+  ors <- fixef_ci(fits$full, zero_event_terms = fits$zero_terms) %>%
+    transmute(term, aOR = fmt_est_ci(estimate, conf.low, conf.high))
+
+  tab <- counts %>%
+    left_join(ors, by = "term") %>%
+    mutate(# zero events in a level: OR not estimable (estimate -> 0, CI 0 - Inf)
+           aOR = case_when(n_outcome == 0 ~ "N/A", is.na(aOR) ~ "ref", TRUE ~ aOR),
+           `n (%)` = sprintf("%d (%.1f)", n_outcome, pct)) %>%
+    group_by(Variable) %>%
+    mutate(`LRT p` = if_else(row_number() == n(), fmt_p(fits$lrt_p[Variable]), "")) %>%
+    ungroup() %>%
+    select(Variable, Level, N, `n (%)`, `aOR (95% CI)` = aOR, `LRT p`)
+
+  list(model = fits$full, table = label_episode_table(tab), lrt_p = fits$lrt_p)
+}
+```
+
+# Data and derived variables
+
+## Import
+
+Unscheduled visits were participant-initiated because of respiratory symptoms, so they are coded as symptomatic. Influenza A/B, RSV A/B and parainfluenza 1–4 are also pooled into "any" variables here.
+
+```{r import}
+full_demog_data <- read.csv(here::here("Data", "full_demog_data.csv"))
+
+input <- read.csv(here::here("Data", "20240327_transvir_vma_with_metadata_CORRECT.csv")) %>%
+  mutate(date = as.Date(date, format = "%Y-%m-%d"),
+         ili_symps_last_week = if_else(event == "Unscheduled Visit", "Yes", ili_symps_last_week))
+
+pool_pcr <- function(...) {
+  cols <- list(...)
+  any_pos <- Reduce(`|`, lapply(cols, function(x) x %in% "Positive"))
+  all_neg <- Reduce(`&`, lapply(cols, function(x) x %in% "Negative"))
+  case_when(any_pos ~ "Positive", all_neg ~ "Negative", TRUE ~ NA_character_)
+}
+
+input <- input %>%
+  mutate(
+    flu_any_pcr = pool_pcr(iav_pcr, ibv_pcr),
+    flu_any_ct  = case_when(iav_pcr == "Positive" ~ iav_ct, ibv_pcr == "Positive" ~ ibv_ct),
+    piv_any_pcr = pool_pcr(piv1_pcr, piv2_pcr, piv3_pcr, piv4_pcr),
+    piv_any_ct  = case_when(piv1_pcr == "Positive" ~ piv1_ct, piv2_pcr == "Positive" ~ piv2_ct,
+                            piv3_pcr == "Positive" ~ piv3_ct, piv4_pcr == "Positive" ~ piv4_ct),
+    rsv_any_pcr = pool_pcr(rsva_pcr, rsvb_pcr),
+    rsv_any_ct  = case_when(rsva_pcr == "Positive" ~ rsva_ct, rsvb_pcr == "Positive" ~ rsvb_ct)
+  )
+
+household_ids <- input %>% distinct(pid) %>% mutate(household_ID = sub("-.*", "", pid))
+
+small_demog <- full_demog_data %>%
+  select(pid = Participant_ID, age_cat, Household_ID, Total_household_no, Sex)
+```
+
+## Infection episodes
+
+An episode starts at a PCR-positive swab with no positive swab for the same virus in the previous 28 days. Any positive within 28 days of the episode start belongs to the same episode. After 28 days, a positive only continues the episode if it is "consecutive", meaning within `r CONSECUTIVE_GAP` days of the previous positive. Duration is the time from the first to the last positive in the episode.
+
+```{r episodes}
+# Assign episode numbers to one participant's swabs for one virus (dates sorted).
+# Negative / missing swabs get NA. Identical logic to the original nested loop.
+assign_episodes <- function(date, detected) {
+  ep <- rep(NA_integer_, length(date))
+  n <- 1L; ep_start <- NA; last_pos <- NA
+  for (i in seq_along(date)) {
+    if (is.na(detected[i]) || detected[i] != "Positive") next
+    if (is.na(ep_start)) {
+      ep_start <- date[i]
+    } else if (as.numeric(date[i] - ep_start) > EPISODE_WINDOW &&
+               as.numeric(date[i] - last_pos) > CONSECUTIVE_GAP) {
+      n <- n + 1L
+      ep_start <- date[i]
+    }
+    ep[i] <- n
+    last_pos <- date[i]
+  }
+  ep
+}
+
+viral_long <- input %>%
+  select(pid, event, instance, date, ends_with("_pcr")) %>%
+  pivot_longer(ends_with("_pcr"), names_to = "virus", values_to = "detected") %>%
+  mutate(virus = str_remove(virus, "_pcr$")) %>%
+  filter(!is.na(detected), virus != "spneumo") %>%
+  arrange(virus, pid, date)
+
+all_episodes <- viral_long %>%
+  group_by(virus, pid) %>%
+  mutate(episode_n = assign_episodes(date, detected)) %>%
+  filter(!is.na(episode_n)) %>%
+  group_by(virus, pid, episode_n) %>%
+  summarise(first_detected_event = first(event),
+            instance   = first(instance),
+            start_date = min(date),
+            end_date   = max(date),
+            duration   = as.numeric(max(date) - min(date)),
+            n_pcrs     = n(),
+            any_unscheduled_pos = any(event == "Unscheduled Visit"),
+            .groups = "drop")
+
+# Species-level episodes are used to define index shedding in the transmission analysis
+viral_episodes_tx <- all_episodes %>% filter(virus %in% tx_lookup$pcr_col)
+
+# Pooled-level episodes (8 virus groups) for incidence, shedding, symptoms
+viral_episodes <- all_episodes %>%
+  filter(virus %in% virus_lookup$virus) %>%
+  left_join(virus_lookup, by = "virus") %>%
+  mutate(virus_proper = factor(virus_proper, levels = virus_order))
+
+add_result("Infection episodes (all viruses)", nrow(viral_episodes))
+episode_counts <- viral_episodes %>% count(virus, name = "Number_Episodes")
+show_results()
+```
+
+## Symptom status, demographics and shedding variables
+
+An episode is symptomatic if any visit from day 0 to day `r SYMPTOM_WINDOW - 1` after the first positive recorded ILI symptoms. Where those visits disagree, symptomatic takes priority over missing, and missing over asymptomatic. Each visit's symptom data is joined to the episode as `visit_date`, so it can't clash with episode columns.
+
+
+```{r symptoms-demog}
+symptom_cols <- c("fever", "cough", "breathlessness", "loss_of_smell", "sore_throat",
+                  "nasal_congestion", "chest_pain", "muscle_ache", "headache",
+                  "vomiting", "diarrhoea")
+
+episode_symptoms <- viral_episodes %>%
+  select(pid, virus, episode_n, start_date) %>%
+  inner_join(input %>% select(pid, visit_date = date, ili_symps_last_week, all_of(symptom_cols)),
+             by = "pid", relationship = "many-to-many") %>%
+  mutate(date_diff = as.numeric(visit_date - start_date),
+         symp = case_when(is.na(ili_symps_last_week) ~ 1,
+                          ili_symps_last_week == "Yes" ~ 2,
+                          TRUE ~ 0)) %>%
+  filter(date_diff >= 0, date_diff < SYMPTOM_WINDOW) %>%
+  arrange(desc(symp)) %>%
+  distinct(pid, episode_n, virus, .keep_all = TRUE) %>%
+  select(pid, virus, episode_n, symp, all_of(symptom_cols))
+
+n_before <- nrow(viral_episodes)
+
+viral_episodes <- viral_episodes %>%
+  inner_join(episode_symptoms, by = c("pid", "virus", "episode_n")) %>%
+  left_join(household_ids, by = "pid") %>%
+  left_join(small_demog %>% select(pid, age_cat, Sex), by = "pid") %>%
+  mutate(
+    # symp: 0 = asymptomatic, 1 = missing, 2 = symptomatic (as in original code)
+    symp = factor(symp, levels = c(0, 1, 2)),
+    # symptomatic: binary outcome, missing excluded (n = 1344 in Table 3)
+    symptomatic = case_when(symp == "2" ~ 1, symp == "0" ~ 0, TRUE ~ NA_real_),
+    long_shed       = as.integer(duration > LONG_SHED_DAYS),  # >1 week
+    long_shed_visit = as.integer(duration > 0),               # >1 visit (Table S3)
+    week_of_shedding = if_else(duration <= 7, 1, ceiling((duration - 7) / 7) + 1),
+    virus   = relevel(factor(virus), ref = "hrv"),
+    age_cat = relevel(factor(age_cat), ref = "18-49")
+  )
+
+if (nrow(viral_episodes) != n_before) {
+  warning(n_before - nrow(viral_episodes),
+          " episodes had no visit within the symptom window and were dropped (as in the original code).")
+}
+add_result("Episodes with missing symptom data", sum(viral_episodes$symp == "1"))
+show_results()
+```
+
+# Participant demographics (Table S1)
+
+```{r cohort}
+n_participants <- n_distinct(input$pid)
+n_households   <- n_distinct(household_ids$household_ID)
+
+add_result("Participants", n_participants)
+add_result("Households", n_households)
+
+swabs <- input %>%
+  summarise(total = n(),
+            scheduled = sum(event != "Unscheduled Visit"),
+            unscheduled = sum(event == "Unscheduled Visit"))
+expected_swabs <- n_participants * STUDY_WEEKS
+
+add_result("Expected scheduled swabs", expected_swabs)
+add_result("Scheduled swabs collected (%)", sprintf("%d (%.1f)", swabs$scheduled, 100 * swabs$scheduled / expected_swabs))
+add_result("Unscheduled swabs", swabs$unscheduled)
+add_result("Total swabs analysed", swabs$total)
+
+followup <- input %>%
+  group_by(pid) %>%
+  summarise(fu_weeks = as.numeric(max(date) - min(date)) / 7)
+add_result("Follow-up weeks, median (IQR)", sprintf("%.1f (%.1f - %.1f)", median(followup$fu_weeks),
+              quantile(followup$fu_weeks, .25), quantile(followup$fu_weeks, .75)))
+show_results()
+```
+
+```{r table-s1}
+s1_participant_vars <- c("Age group" = "age_cat",
+                         "Sex" = "Sex",
+                         "Running water" = "running_water",          # <- check name
+                         "Flush toilet" = "flush_toilet",            # <- check name
+                         "Hand washing inside household" = "handwashing")  # <- check name
+s1_household_vars   <- c("Monthly household income (GMD)" = "household_income",  # <- check name
+                         "Education of household head" = "head_education",     # <- check name
+                         "Household size" = "Total_household_no_cat")
+rooms_col <- "number_of_rooms"                                                  # <- check name
+
+demog_s1 <- full_demog_data %>%
+  filter(Participant_ID %in% input$pid) %>%
+  mutate(Total_household_no_cat = cut_household(Total_household_no))
+
+tab_levels <- function(df, vars) {
+  found <- vars[vars %in% names(df)]
+  missing <- vars[!vars %in% names(df)]
+  if (length(missing)) message("Table S1 - columns not found: ", paste(missing, collapse = ", "))
+  map_dfr(names(found), function(lbl) {
+    df %>% count(Level = as.character(.data[[found[[lbl]]]])) %>%
+      mutate(Factor = lbl, `N (%)` = sprintf("%d (%.1f)", n, 100 * n / sum(n))) %>%
+      select(Factor, Level, `N (%)`)
+  })
+}
+
+household_level <- demog_s1 %>% distinct(Household_ID, .keep_all = TRUE)
+
+table_s1 <- bind_rows(
+  tab_levels(demog_s1, s1_participant_vars),
+  tab_levels(household_level, s1_household_vars),
+  tibble(Factor = "Follow-up duration, weeks, median (IQR)", Level = "-",
+         `N (%)` = sprintf("%.1f (%.1f - %.1f)", median(followup$fu_weeks),
+                           quantile(followup$fu_weeks, .25), quantile(followup$fu_weeks, .75))),
+  tibble(Factor = "Household size, median (IQR)", Level = "-",
+         `N (%)` = with(household_level, sprintf("%g (%g - %g)", median(Total_household_no),
+                        quantile(Total_household_no, .25), quantile(Total_household_no, .75))))
+)
+if (rooms_col %in% names(household_level)) {
+  r <- household_level[[rooms_col]]
+  table_s1 <- add_row(table_s1, Factor = "Number of rooms, median (IQR)", Level = "-",
+                      `N (%)` = sprintf("%g (%g - %g)", median(r, na.rm = TRUE),
+                                        quantile(r, .25, na.rm = TRUE), quantile(r, .75, na.rm = TRUE)))
+}
+table_s1
+write.csv(table_s1, file.path(out_dir, "TableS1_demographics.csv"), row.names = FALSE)
+```
+
+# Incidence of respiratory viruses
+
+## Sample positivity
+
+ Positivity uses the 13 virus targets, excluding *S. pneumoniae*, at species level.
+
+```{r positivity}
+species_cols <- paste0(c("hrv", "cov2", "corona", "adeno", "hmpv", "iav", "ibv",
+                         "rsva", "rsvb", "piv1", "piv2", "piv3", "piv4"), "_pcr")
+
+positivity <- input %>%
+  mutate(n_viruses = rowSums(across(all_of(species_cols), ~ .x %in% "Positive")),
+         any_virus = n_viruses > 0,
+         unscheduled = event == "Unscheduled Visit")
+
+add_result("Samples with >=1 virus (%)", sprintf("%d (%.1f)", sum(positivity$any_virus), 100 * mean(positivity$any_virus)))
+add_result("Samples with >1 virus (%)", sprintf("%d (%.1f)", sum(positivity$n_viruses > 1), 100 * mean(positivity$n_viruses > 1)))
+add_result("Positivity, routine visits (%)", sprintf("%.1f", 100 * mean(positivity$any_virus[!positivity$unscheduled])))
+add_result("Positivity, unscheduled visits (%)", sprintf("%.1f", 100 * mean(positivity$any_virus[positivity$unscheduled])))
+add_result("Positivity, symptomatic routine visits (%)", sprintf("%.1f", 100 * with(positivity, mean(any_virus[!unscheduled & ili_symps_last_week %in% "Yes"]))))
+show_results()
+```
+
+## Incidence risk (Table 1)
+
+Incidence risk comes from the intercept of a logistic model (infected during follow-up yes/no) with a household random intercept.
+
+```{r incidence-risk}
+infection_status <- tibble(pid = unique(input$pid))
+for (v in unique(viral_episodes$virus)) {
+  infection_status[[as.character(v)]] <- as.integer(infection_status$pid %in% viral_episodes$pid[viral_episodes$virus == v])
+}
+infection_status <- infection_status %>%
+  mutate(infected_any = as.integer(rowSums(across(-pid)) > 0)) %>%
+  left_join(household_ids, by = "pid")
+
+incidence_risk <- map_dfr(setdiff(names(infection_status), c("pid", "household_ID")), function(v) {
+  m  <- glmer_safe(as.formula(paste(v, "~ 1 + (1 | household_ID)")),
+              data = infection_status, family = binomial(link = "logit"))
+  ci <- confint(m, parm = "(Intercept)", method = "Wald")
+  tibble(virus = v,
+         n_infected = sum(infection_status[[v]]),
+         incidence_risk = fmt_est_ci(100 * plogis(fixef(m)), 100 * plogis(ci[1]), 100 * plogis(ci[2]), 1))
+})
+incidence_risk
+
+add_result("Overall incidence risk % (95% CI)", incidence_risk$incidence_risk[incidence_risk$virus == "infected_any"])
+show_results()
+```
+
+## Incidence rate (Table 1)
+
+Incidence rate comes from the intercept of a Poisson model with a log person-time offset and a household random intercept. Person-time starts at the first visit. After each infection, the participant is not at risk until 28 days after episode start (or until the episode ends, if it lasted longer than 28 days). Infections on the first visit day contribute no person-time and are dropped. That leaves 1,388 of 1,423 infections in the rate denominators (Table S6 footnote).
+
+
+```{r lexis-setup}
+# Build Lexis follow-up for one virus (unchanged logic from original process_virus_data)
+build_lexis <- function(virus_name, episodes, input, demog) {
+  episodes <- episodes %>%
+    mutate(end_date = if_else(duration <= EPISODE_WINDOW, start_date + EPISODE_WINDOW, end_date)) %>%
+    filter(virus == virus_name)
+
+  participant_data <- input %>%
+    group_by(pid) %>%
+    summarize(follow_start = min(date), follow_end = max(date)) %>%
+    ungroup() %>%
+    filter(follow_start < follow_end)
+
+  cox_data <- tmerge(participant_data, participant_data, id = pid,
+                     tstart = follow_start, tstop = follow_end)
+  cox_data <- tmerge(cox_data, episodes, id = pid, infection_event = event(start_date))
+
+  cox_data <- cox_data %>%
+    left_join(episodes %>% select(pid, start_date, end_date),
+              by = c("pid", "tstart" = "start_date")) %>%
+    arrange(pid, tstart) %>%
+    mutate(tstart = if_else(is.na(end_date), tstart, end_date),
+           tstop  = if_else(infection_event == 0, follow_end, tstop))
+
+  lexis_inf <- cox_data %>%
+    mutate(timein  = cal.yr(as.Date(tstart)),
+           timeout = cal.yr(as.Date(tstop)),
+           infection = infection_event,
+           Baseline_date = cal.yr(as.Date(follow_start)),
+           ID = pid) %>%
+    {Lexis(entry = list("calendar_time" = .$timein),
+           exit  = list("calendar_time" = .$timeout),
+           exit.status = .$infection == 1, id = .$ID, data = ., keep.dropped = TRUE)}
+
+  lexis_inf %>% left_join(demog, by = "pid")
+}
+
+# Lexis() prints a NOTE for every virus about dropped zero-length rows; captured to keep the log readable
+invisible(capture.output(
+  lexis_data_list <- map(set_names(as.character(virus_lookup$virus)),
+                         build_lexis, episodes = viral_episodes, input = input, demog = small_demog)
+))
+
+lexis_infections <- map_dbl(lexis_data_list, ~ sum(.x$lex.Xst))
+add_result("Infections contributing to rate models", sum(lexis_infections))
+show_results()
+```
+
+```{r incidence-rate}
+incidence_rate <- imap_dfr(lexis_data_list, function(d, v) {
+  m  <- glmer_safe(lex.Xst ~ offset(log(lex.dur)) + (1 | Household_ID), data = d, family = poisson)
+  ci <- intercept_ci(m)
+  tibble(virus = v, incidence_rate = fmt_est_ci(exp(fixef(m)), exp(ci[1]), exp(ci[2]), 2))
+})
+
+table1 <- episode_counts %>%
+  left_join(incidence_risk, by = "virus") %>%
+  left_join(incidence_rate, by = "virus") %>%
+  left_join(virus_lookup, by = "virus") %>%
+  arrange(desc(Number_Episodes)) %>%
+  select(Virus = virus_proper, `Infection episodes` = Number_Episodes,
+         `Participants infected` = n_infected,
+         `Incidence risk, % (95% CI)` = incidence_risk,
+         `Incidence rate, per person-year (95% CI)` = incidence_rate)
+table1
+write.csv(table1, file.path(out_dir, "Table1_incidence.csv"), row.names = FALSE)
+
+t1_hrv <- table1 %>% filter(Virus == "HRV")
+```
+
+
+```{r incidence-overall}
+combined_virus_data <- map(lexis_data_list, ~ as.data.frame(.x) %>%
+                             mutate(across(everything(), as.character))) %>%
+  bind_rows(.id = "virus") %>%
+  mutate(lex.dur = as.numeric(lex.dur),
+         infection_event = as.numeric(infection_event))
+
+# Stacked person-time counts each person once per virus; rescale to calendar person-time
+hrv_fu <- as.data.frame(lexis_data_list[["hrv"]]) %>% mutate(lex.dur = as.numeric(lex.dur))
+overall_modifier <- sum(combined_virus_data$lex.dur) / sum(hrv_fu$lex.dur)
+
+m_overall <- glmer_safe(infection_event ~ offset(log(lex.dur)) + (1 | Household_ID),
+                   data = combined_virus_data, family = poisson)
+se <- sqrt(vcov(m_overall)[1, 1])
+overall_rate <- fmt_est_ci(exp(fixef(m_overall)) * overall_modifier,
+                           exp(fixef(m_overall) - 1.96 * se) * overall_modifier,
+                           exp(fixef(m_overall) + 1.96 * se) * overall_modifier, 1)
+add_result("Overall incidence rate per person-year", overall_rate)
+show_results()
+```
+
+## Cumulative incidence (Figure 1A)
+
+Kaplan–Meier cumulative incidence of the first episode of each virus per participant, with time measured from each participant's first visit.
+
+```{r figure-1a, fig.height = 6}
+fu_dates <- input %>% group_by(pid) %>% summarise(follow_start = min(date), follow_end = max(date))
+
+km_data <- expand_grid(pid = fu_dates$pid, virus_proper = virus_order) %>%
+  left_join(fu_dates, by = "pid") %>%
+  left_join(viral_episodes %>% group_by(pid, virus_proper = as.character(virus_proper)) %>%
+              summarise(first_inf = min(start_date), .groups = "drop"),
+            by = c("pid", "virus_proper")) %>%
+  mutate(event = as.integer(!is.na(first_inf)),
+         time_weeks = as.numeric(if_else(event == 1, first_inf, follow_end) - follow_start) / 7,
+         virus_proper = factor(virus_proper, levels = virus_order))
+
+km_fit <- survfit(Surv(time_weeks, event) ~ virus_proper, data = km_data)
+km_df <- tidy(km_fit) %>%
+  mutate(virus_proper = factor(str_remove(strata, "virus_proper="), levels = virus_order),
+         cum_inc = 100 * (1 - estimate), lo = 100 * (1 - conf.high), hi = 100 * (1 - conf.low)) %>%
+  group_by(virus_proper) %>%
+  arrange(time, .by_group = TRUE) %>%
+  mutate(time_end = lead(time, default = last(time))) %>%
+  ungroup()
+
+figure_1a <- ggplot(km_df, aes(time, cum_inc, colour = virus_proper, fill = virus_proper)) +
+  geom_step(linewidth = 0.8) +
+  geom_rect(aes(xmin = time, xmax = time_end, ymin = lo, ymax = hi),
+            alpha = 0.15, colour = NA) +
+  scale_colour_manual(values = color_vector, name = "Virus") +
+  scale_fill_manual(values = color_vector, name = "Virus") +
+  scale_x_continuous(breaks = seq(0, 52, 4)) +
+  labs(x = "Weeks", y = "Cumulative incidence (%)") +
+  theme_minimal(base_size = 13) + coord_cartesian(xlim=c(0,52))
+figure_1a
+ggsave(file.path(out_dir, "Figure1A_cumulative_incidence.png"), figure_1a, width = 10, height = 6, dpi = 600)
+```
+
+## Epidemic curve (Figure 1B)
+
+```{r figure-s2, fig.height = 5}
+epi_curve_data <- viral_episodes %>%
+  mutate(week = floor_date(start_date, "week", week_start = 1)) %>%
+  count(week, virus_proper, name = "n_episodes") %>%
+  complete(week, virus_proper, fill = list(n_episodes = 0)) %>%
+  arrange(virus_proper, week) %>%
+  group_by(virus_proper) %>%
+  mutate(n_smooth = rollmean(n_episodes, k = 3, fill = NA, align = "center")) %>%
+  ungroup()
+
+figure_s2 <- ggplot(epi_curve_data, aes(week, n_smooth, colour = virus_proper)) +
+  geom_line(linewidth = 0.8, alpha = 0.9) +
+  geom_point(size = 1.2, alpha = 0.7) +
+  scale_colour_manual(values = color_vector, name = "Virus") +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b %Y",
+               limits = as.Date(c("2021-03-01", "2022-06-30")), expand = c(0.01, 0.01)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 6), expand = c(0, 0.5)) +
+  labs(x = "Date", y = "Infections per week (3-week rolling mean)") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.minor = element_blank())
+figure_s2
+ggsave(file.path(out_dir, "FigureS2_epi_curve.png"), figure_s2, width = 12, height = 6, dpi = 600)
+```
+
+## Restricted follow-up sensitivity analysis (Table S2)
+
+Follow-up is split into one window per swab. If the previous swab was within 10 days, the whole gap counts as at-risk time. Otherwise a visit was missed, and follow-up restarts 7 days before the resuming swab. A participant's first swab gets a 1-day window.
+
+```{r restricted-followup}
+# Coverage windows per swab (as used for the published Table S2):
+#  - gap to previous swab <= 10 days: the whole gap counts as follow-up
+#  - gap > 10 days (missed visit): follow-up restarts 7 days before the resuming swab
+#  - first swab: 1-day window
+# NOTE: windows are built per swab, so the 28-day post-infection exclusion used
+# in the main analysis is not applied here (the time after an infection falls in
+# later windows and counts as at-risk time).
+pcr_cols <- c("cov2_pcr", "iav_pcr", "ibv_pcr", "rsva_pcr", "rsvb_pcr", "hmpv_pcr",
+              "piv1_pcr", "piv2_pcr", "piv3_pcr", "piv4_pcr", "hrv_pcr",
+              "corona_pcr", "adeno_pcr", "spneumo_pcr")
+
+input_swabs <- input %>%
+  mutate(swab_taken = as.integer(rowSums(!is.na(across(all_of(pcr_cols)))) > 0))
+
+build_lexis_restricted <- function(virus_name, episodes, input_swabs, demog,
+                                   schedule_tolerance = RESTRICT_GAP,
+                                   lookback_window = RESTRICT_PRIOR) {
+  episodes <- episodes %>%
+    mutate(end_date = if_else(duration <= EPISODE_WINDOW, start_date + EPISODE_WINDOW, end_date)) %>%
+    filter(virus == virus_name)
+
+  swab_windows <- input_swabs %>%
+    filter(swab_taken == 1) %>%
+    arrange(pid, date) %>%
+    group_by(pid) %>%
+    mutate(prev_swab_date = lag(date),
+           gap_to_prev = as.numeric(date - prev_swab_date)) %>%
+    ungroup() %>%
+    mutate(follow_start = case_when(
+             is.na(prev_swab_date)             ~ date - 1,
+             gap_to_prev <= schedule_tolerance ~ prev_swab_date,
+             TRUE ~ pmax(date - lookback_window, prev_swab_date)),
+           follow_end = date) %>%
+    filter(follow_start < follow_end) %>%
+    mutate(uid = paste(pid, row_number(), sep = "_")) %>%
+    select(pid, uid, follow_start, follow_end)
+
+  cox_data <- tmerge(swab_windows, swab_windows, id = uid,
+                     tstart = follow_start, tstop = follow_end)
+
+  infections_in_coverage <- episodes %>%
+    inner_join(swab_windows, by = "pid", relationship = "many-to-many") %>%
+    filter(start_date >= follow_start & start_date <= follow_end) %>%
+    select(uid, pid, start_date, end_date)
+
+  cox_data <- tmerge(cox_data, infections_in_coverage, id = uid,
+                     infection_event = event(start_date))
+
+  cox_data <- cox_data %>%
+    left_join(infections_in_coverage %>% select(uid, start_date, end_date),
+              by = c("uid", "tstart" = "start_date")) %>%
+    arrange(uid, tstart) %>%
+    mutate(tstart = if_else(is.na(end_date), tstart, end_date),
+           pid = sub("_[^_]+$", "", uid))
+
+  lexis_inf <- cox_data %>%
+    mutate(timein  = cal.yr(as.Date(tstart)),
+           timeout = cal.yr(as.Date(tstop)),
+           infection = infection_event,
+           ID = uid) %>%
+    {Lexis(entry = list("calendar_time" = .$timein),
+           exit  = list("calendar_time" = .$timeout),
+           exit.status = .$infection == 1, id = .$ID, data = ., keep.dropped = TRUE)}
+
+  lexis_inf %>% left_join(demog, by = "pid")
+}
+
+invisible(capture.output(
+  lexis_restricted <- map(set_names(as.character(virus_lookup$virus)), build_lexis_restricted,
+                          episodes = viral_episodes, input_swabs = input_swabs, demog = small_demog) %>%
+    map(~ as.data.frame(.x) %>% mutate(restricted_dur = lex.dur))   # used by Table S8
+))
+
+incidence_rate_restricted <- imap_dfr(lexis_restricted, function(d, v) {
+  m  <- glmer_safe(lex.Xst ~ offset(log(lex.dur)) + (1 | Household_ID), data = d, family = poisson)
+  ci <- intercept_ci(m)
+  tibble(virus = v, restricted_rate = fmt_est_ci(exp(fixef(m)), exp(ci[1]), exp(ci[2]), 2))
+})
+
+table_s2 <- incidence_rate %>%
+  left_join(incidence_rate_restricted, by = "virus") %>%
+  left_join(virus_lookup, by = "virus") %>%
+  select(Virus = virus_proper, `Incidence rate (95% CI)` = incidence_rate,
+         `Restricted incidence rate (95% CI)` = restricted_rate)
+table_s2
+write.csv(table_s2, file.path(out_dir, "TableS2_restricted_incidence.csv"), row.names = FALSE)
+```
+
+# Viral shedding
+
+## Duration of shedding (Figure 2A)
+
+```{r shedding-summary}
+shedding_summary <- viral_episodes %>%
+  group_by(virus_proper) %>%
+  summarise(n = n(), median_days = median(duration), IQR_days = IQR(duration),
+            mean_days = round(mean(duration), 1),
+            pct_over_1_week = round(100 * mean(long_shed), 1),
+            max_weeks = max(week_of_shedding))
+shedding_summary
+write.csv(shedding_summary, file.path(out_dir, "shedding_summary.csv"), row.names = FALSE)
+
+add_result("Episodes shedding >1 week (%)", sprintf("%d (%.1f)", sum(viral_episodes$long_shed), 100 * mean(viral_episodes$long_shed)))
+add_result("Max shedding, weeks: HRV / RSV / SARS-CoV-2 / SeasCoV", with(shedding_summary, paste(max_weeks[match(c("HRV", "RSV", "SARS-CoV-2", "Seasonal Coronaviruses"), virus_proper)], collapse = " / ")))
+show_results()
+```
+
+```{r figure-1b, fig.height = 7}
+viral_episodes <- viral_episodes %>%
+  mutate(virus_proper = factor(virus_proper,
+                               levels = rev(names(color_vector))  # reverses HRV...Influenza order so HRV is at the bottom
+  ))
+
+figure_1b <- ggplot(viral_episodes, aes(x = as.numeric(as.character(duration + 1)), fill = virus_proper)) +
+  geom_histogram(binwidth = 1, color = "white") +
+  facet_wrap(~virus_proper, ncol = 1, scales = "free_y") +
+  labs(x = "Days", y = NULL) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(hjust = 0, face = "bold"),
+    strip.background = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA)
+  ) +
+  scale_y_continuous(
+    trans = scales::trans_new("log1p", transform = log1p, inverse = expm1),
+    breaks = c(0, 10, 100),
+    limits = c(0, 1000)
+  ) +
+  scale_fill_manual(values = color_vector)
+figure_1b
+
+ggsave(file.path(out_dir, "Figure1B_shedding.png"), figure_1b, width = 10, height = 10, dpi = 600)
+```
+
+## Factors associated with shedding >1 week (Table 2)
+
+Mixed-effects logistic regression with symptom status, virus, age group and sex as fixed effects, and household/participant as nested random intercepts. P-values are from likelihood-ratio tests comparing models with and without each variable.
+
+Where a level has no events (e.g. no HMPV or influenza episode shed for more than a week), its odds ratio can't be estimated. The estimate tends to 0 with an unbounded CI, so these are shown as N/A. The level stays in the model, as in the original analysis.
+
+```{r table-2}
+shed_covars <- c("symp", "virus", "age_cat", "Sex")
+table2 <- episode_model_table(viral_episodes, "long_shed", shed_covars)
+table2$table
+write.csv(table2$table, file.path(out_dir, "Table2_shedding.csv"), row.names = FALSE)
+
+```
+
+```{r shedding-interaction}
+ctrl <- glmerControl(optimizer = "bobyqa")
+shed_interact <- glmer_safe(long_shed ~ symp + virus * age_cat + Sex + (1 | household_ID/pid),
+                            data = viral_episodes, family = binomial(link = "logit"), control = ctrl)
+p_shed_interact <- lrtest(shed_interact, table2$model)[2, 5]
+add_result("Age x virus interaction on shedding >1 week, p", fmt_p(p_shed_interact))
+show_results()
+```
+
+## Sensitivity analyses (Tables S3 and S4)
+
+Table S3 redefines long shedding as positive at more than one visit (`long_shed_visit`, i.e. `long_shed_v2`: `duration > 0`), using all episodes. Table S4 keeps the main >1-week definition but excludes episodes whose first positive swab was at an unscheduled visit.
+
+
+```{r table-s3-s4}
+table_s3 <- episode_model_table(viral_episodes, "long_shed_visit", shed_covars)
+table_s3$table
+write.csv(table_s3$table, file.path(out_dir, "TableS3_shedding_gt1visit.csv"), row.names = FALSE)
+
+table_s4 <- episode_model_table(filter(viral_episodes, first_detected_event != "Unscheduled Visit"),
+                                "long_shed", shed_covars)
+table_s4$table
+write.csv(table_s4$table, file.path(out_dir, "TableS4_shedding_excl_unscheduled.csv"), row.names = FALSE)
+```
+
+# Asymptomatic and symptomatic infections
+
+## Symptomatic infection by virus, age and sex (Table 3 / Table S11)
+
+The outcome is symptomatic (1) vs asymptomatic (0). The 79 episodes with missing symptom data are excluded, which matches the n = 1344 in the table footnote.
+
+
+```{r table-3}
+symp_data <- filter(viral_episodes, !is.na(symptomatic))
+table3 <- episode_model_table(symp_data, "symptomatic", c("virus", "age_cat", "Sex"))
+
+# Counts use all 1423 episodes for N (as in the published table) and exclude missing from %
+table3_counts <- map_dfr(c("virus", "age_cat", "Sex"), function(v) {
+  viral_episodes %>% group_by(Level = as.character(.data[[v]])) %>%
+    summarise(N_all = n(), n_symp = sum(symptomatic == 1, na.rm = TRUE),
+              pct = round(100 * mean(symptomatic, na.rm = TRUE), 1), .groups = "drop") %>%
+    mutate(Variable = episode_var_labels[[v]], Level = recode(Level, !!!episode_level_labels))
+})
+table3_out <- table3$table %>%
+  select(-N, -`n (%)`) %>%
+  mutate(Variable = as.character(Variable)) %>%
+  left_join(table3_counts, by = c("Variable", "Level")) %>%
+  transmute(Variable, Level, `Total infections` = N_all,
+            `Symptomatic (%)` = sprintf("%d (%.1f)", n_symp, pct),
+            `aOR (95% CI)`, `LRT p`)
+table3_out
+write.csv(table3_out, file.path(out_dir, "Table3_TableS11_symptomatic.csv"), row.names = FALSE)
+
+add_result("Symptomatic episodes (%)", sprintf("%d (%.1f)", sum(viral_episodes$symptomatic == 1, na.rm = TRUE),
+              100 * sum(viral_episodes$symptomatic == 1, na.rm = TRUE) / nrow(viral_episodes)))
+
+
+symp_interact <- glmer_safe(symptomatic ~ virus * age_cat + Sex + (1 | household_ID/pid), data = symp_data,
+                       family = binomial(link = "logit"), control = glmerControl(optimizer = "bobyqa"))
+
+show_results()
+```
+
+## Specific symptoms by virus (Table S5)
+
+```{r table-s5}
+symptom_long <- viral_episodes %>%
+  mutate(across(all_of(symptom_cols), ~ as.integer(.x == "Checked"))) %>%
+  pivot_longer(all_of(symptom_cols), names_to = "symptom", values_to = "present")
+
+table_s5 <- bind_rows(
+  symptom_long %>% mutate(Virus = as.character(virus_proper)),
+  symptom_long %>% mutate(Virus = "All Viruses")
+) %>%
+  group_by(Virus, symptom) %>%
+  summarise(n = sum(present, na.rm = TRUE), total = n(), .groups = "drop") %>%
+  mutate(value = sprintf("%d (%.1f%%)", n, 100 * n / total)) %>%
+  select(-n) %>%
+  pivot_wider(names_from = symptom, values_from = value) %>%
+  left_join(bind_rows(
+    viral_episodes %>% group_by(Virus = as.character(virus_proper)) %>%
+      summarise(symp_n = sum(symptomatic == 1, na.rm = TRUE), symp_pct = 100 * mean(symptomatic, na.rm = TRUE)),
+    viral_episodes %>% summarise(Virus = "All Viruses", symp_n = sum(symptomatic == 1, na.rm = TRUE),
+                                 symp_pct = 100 * mean(symptomatic, na.rm = TRUE))),
+    by = "Virus") %>%
+  mutate(`Symptomatic (%)` = sprintf("%d (%.1f)", symp_n, symp_pct),
+         Virus = factor(Virus, levels = c(virus_order, "All Viruses"))) %>%
+  arrange(Virus) %>%
+  select(Virus, `Infections` = total, `Symptomatic (%)`, all_of(sort(symptom_cols)))
+table_s5
+write.csv(table_s5, file.path(out_dir, "TableS5_symptoms_by_virus.csv"), row.names = FALSE)
+
+```
+
+
+# Risk factors for infection
+
+## Incidence by age, all viruses (Table S6)
+
+The rate for each age group comes from a Poisson GLMM on the stacked virus-specific person-time. It is scaled back to calendar person-years by each age group's ratio of stacked to single-virus person-time. Age p-value: LRT for age in a model that also adjusts for virus and sex.
+
+```{r table-s6}
+age_rate <- rate(combined_virus_data, obs = infection_event, pyrs = lex.dur, print = "age_cat")
+hrv_age_fu <- rate(hrv_fu %>% mutate(infection = as.numeric(infection)),
+                   obs = infection, pyrs = lex.dur, print = "age_cat")
+age_modifier <- set_names(age_rate$lex.dur / hrv_age_fu$lex.dur[match(age_rate$age_cat, hrv_age_fu$age_cat)],
+                          age_rate$age_cat)
+
+table_s6 <- map_dfr(names(age_modifier), function(a) {
+  d <- combined_virus_data %>% mutate(age_cat = relevel(factor(age_cat), ref = a))
+  m <- glmer_safe(infection_event ~ offset(log(lex.dur)) + age_cat + (1 | Household_ID), data = d, family = poisson)
+  se <- sqrt(vcov(m)[1, 1]); k <- age_modifier[[a]]
+  tibble(`Age group` = a,
+         Participants = sum(small_demog$age_cat == a & small_demog$pid %in% input$pid, na.rm = TRUE),
+         Infections = sum(d$infection_event[d$age_cat == a]),
+         `Incidence rate (95% CI)` = fmt_est_ci(exp(fixef(m)[1]) * k, exp(fixef(m)[1] - 1.96 * se) * k,
+                                                exp(fixef(m)[1] + 1.96 * se) * k, 1))
+})
+
+virus_age_model    <- glmer_safe(infection_event ~ offset(log(lex.dur)) + age_cat + virus + Sex + (1 | Household_ID/pid),
+                            data = combined_virus_data, family = poisson)
+virus_no_age_model <- glmer_safe(infection_event ~ offset(log(lex.dur)) + virus + Sex + (1 | Household_ID/pid),
+                            data = combined_virus_data, family = poisson)
+virus_interact_age_model <- glmer_safe(infection_event ~ offset(log(lex.dur)) + age_cat * virus + Sex + (1 | Household_ID/pid),
+                                  data = combined_virus_data, family = poisson)
+p_age_incidence  <- lrtest(virus_age_model, virus_no_age_model)[2, 5]
+p_age_virus_int  <- lrtest(virus_age_model, virus_interact_age_model)[2, 5]
+
+table_s6$`P-value` <- c(rep("", nrow(table_s6) - 1), fmt_p(p_age_incidence))
+table_s6
+write.csv(table_s6, file.path(out_dir, "TableS6_incidence_by_age.csv"), row.names = FALSE)
+
+add_result("Age x virus interaction on incidence, p", fmt_p(p_age_virus_int))
+show_results()
+```
+
+## Virus-specific Anderson–Gill models (Table S7, Figure 2A)
+
+These are Cox models on gap time (`lex.dur`), with household size, age group and sex as covariates and robust standard errors for clustering.
+
+
+```{r cox-models}
+lexis_data_list <- map(lexis_data_list, function(df) {
+  df$Total_household_no <- cut_household(df$Total_household_no)
+  df$age_cat <- relevel(as.factor(df$age_cat), ref = "18-49")
+  df
+})
+
+run_cox_analysis <- function(df) {
+  covs <- c("Total_household_no", "age_cat", "Sex")
+  full_model <- coxph(Surv(lex.dur, lex.Xst) ~ Total_household_no + age_cat + Sex +
+                        cluster(pid, Household_ID), data = df)
+  hr <- tidy(full_model, exponentiate = TRUE, conf.int = TRUE) %>%
+    mutate(variable = str_extract(term, paste(covs, collapse = "|")),
+           aHR = fmt_est_ci(estimate, conf.low, conf.high))
+  lrt <- map_dfr(covs, function(v) {
+    f <- as.formula(paste("Surv(lex.dur, lex.Xst) ~", paste(setdiff(covs, v), collapse = " + "),
+                          "+ cluster(pid, Household_ID)"))
+    tibble(variable = v, p_value = lrtest(coxph(f, data = df), full_model)[2, 5])
+  })
+  left_join(hr, lrt, by = "variable")
+}
+
+cox_results <- imap_dfr(lexis_data_list, ~ run_cox_analysis(.x) %>% mutate(virus = .y))
+
+table_s7 <- cox_results %>%
+  left_join(virus_lookup, by = "virus") %>%
+  group_by(virus_proper, variable) %>%
+  mutate(`P-value` = if_else(row_number() == n(), fmt_p(p_value), "")) %>%
+  ungroup() %>%
+  select(Virus = virus_proper, Variable = variable, Term = term, `aHR (95% CI)` = aHR, `P-value`)
+table_s7
+write.csv(table_s7, file.path(out_dir, "TableS7_cox_by_virus.csv"), row.names = FALSE)
+
+cox_p <- cox_results %>% filter(variable == "age_cat") %>% distinct(virus, p_value)
+```
+
+**Figure 2A**, a forest plot of age-group aHRs by virus (reference 18–49).
+
+```{r figure-2a, fig.height = 11, fig.width = 7}
+fig2a_viruses <- c(hrv = "HRV", cov2 = "SARS-CoV-2", corona = "Seasonal Coronavirus",
+                   piv_any = "Parainfluenza Virus", rsv_any = "RSV")
+age_levels <- c("<5", "5-17", "18-49", ">50")
+
+# aHRs and CIs from the same Cox models as Table S7
+adjusted_HR_age_by_virus <- cox_results %>%
+  filter(variable == "age_cat", virus %in% names(fig2a_viruses)) %>%
+  transmute(virus = factor(fig2a_viruses[virus], levels = fig2a_viruses),
+            age = factor(str_remove(term, "^age_cat"), levels = age_levels),
+            aHR = estimate, aHR_lower = conf.low, aHR_upper = conf.high)
+
+# Reference group (18-49, aHR = 1)
+red_dots <- tibble(virus = factor(fig2a_viruses, levels = fig2a_viruses),
+                   age = factor("18-49", levels = age_levels), aHR = 1)
+
+# Likelihood-ratio test p-value for age, one per virus
+p_values <- cox_results %>%
+  filter(variable == "age_cat", virus %in% names(fig2a_viruses)) %>%
+  distinct(virus, p_value) %>%
+  transmute(virus = factor(fig2a_viruses[virus], levels = fig2a_viruses),
+            formatted_p_value = paste0("p = ", fmt_p(p_value)))
+
+label_size <- 4
+shared_theme <- theme_minimal(base_size = 13) +
+  theme(strip.text = element_text(face = "bold", size = 12),
+        panel.grid.minor = element_blank())
+
+forest_plot <- ggplot(adjusted_HR_age_by_virus,
+                      aes(x = aHR, y = age, xmin = aHR_lower, xmax = aHR_upper)) +
+  geom_pointrange() +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red") +
+  facet_wrap(~ virus, ncol = 1) +
+  geom_text(data = p_values, aes(x = 5, y = Inf, label = formatted_p_value),
+            size = label_size, hjust = 1, vjust = 1.3, inherit.aes = FALSE) +
+  geom_point(data = red_dots, aes(x = aHR, y = age), color = "red", size = 3,
+             inherit.aes = FALSE) +
+  scale_y_discrete(drop = FALSE) +
+  labs(x = "Adjusted Hazard Ratio (aHR)", y = "Age Group") +
+  coord_cartesian(xlim = c(0, 5)) +
+  shared_theme +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12))
+
+forest_plot
+ggsave(file.path(out_dir, "Figure2A_age_aHR.png"), forest_plot,
+       width = 7, height = 11, dpi = 600)
+```
+
+
+
+## Proportional hazards (Supplementary Methods)
+
+`cox.zph()` can't be used with `cluster()`, so each model is refitted without clustering to test the proportional hazards assumption. Only flagged terms are plotted.
+
+```{r ph-tests}
+ph_results <- imap(lexis_data_list, function(df, v) {
+  df <- df %>% mutate(event = as.integer(lex.Xst))
+  cox.zph(coxph(Surv(lex.dur, event) ~ Total_household_no + age_cat + Sex, data = df))
+})
+
+ph_summary <- imap_dfr(ph_results, ~ as.data.frame(.x$table) %>%
+                         rownames_to_column("variable") %>% mutate(virus = .y)) %>%
+  transmute(virus, variable, chisq = round(chisq, 3), df, p = round(p, 3),
+            flag = if_else(p < 0.05 & variable != "GLOBAL", "Possible violation", "OK"))
+ph_summary
+write.csv(ph_summary, file.path(out_dir, "ph_assumption_results.csv"), row.names = FALSE)
+
+flagged <- filter(ph_summary, flag != "OK")
+for (i in seq_len(nrow(flagged))) {
+  zph <- ph_results[[flagged$virus[i]]]
+  plot(zph[which(rownames(zph$table) == flagged$variable[i])],
+       main = paste("Schoenfeld residuals:", flagged$virus[i], "-", flagged$variable[i]))
+}
+add_result("Flagged terms (virus:variable p)", paste(sprintf("%s:%s %.3f", flagged$virus, flagged$variable, flagged$p), collapse = "; "))
+show_results()
+```
+
+## Restricted follow-up Cox models (Table S8)
+
+These are the same models as Table S7, but using the restricted at-risk time from the Table S2 sensitivity analysis.
+
+```{r table-s8}
+lexis_restricted <- map(lexis_restricted, function(df) {
+  df$Total_household_no <- cut_household(as.numeric(df$Total_household_no))
+  df$age_cat <- relevel(as.factor(df$age_cat), ref = "18-49")
+  df
+})
+table_s8 <- imap_dfr(lexis_restricted, function(df, v) {
+  df$lex.dur <- df$restricted_dur
+  run_cox_analysis(df) %>% mutate(virus = v)
+}) %>%
+  left_join(virus_lookup, by = "virus") %>%
+  select(Virus = virus_proper, Variable = variable, Term = term, `aHR (95% CI)` = aHR, p_value)
+table_s8
+write.csv(table_s8, file.path(out_dir, "TableS8_cox_restricted.csv"), row.names = FALSE)
+```
+
+# Household transmission
+
+## Cluster definition
+
+Each household is searched for sequential clusters of each virus, at species level. A cluster starts at the first positive in the household after the previous cluster ended. Participants positive on that date are index cases, and clusters with more than one are co-index clusters and are excluded. Household members tested within 14 days of the index (primary), or of later positives (secondary, tertiary), are exposed. Each exposed participant contributes one row: their first positive, otherwise their first negative. A cluster ends at the last positive linked to it, cutting at any gap longer than 28 days. Up to `r TX_MAX_ROUNDS` rounds are searched per household and virus.
+
+
+```{r cluster-function}
+first_result_per_person <- function(df) {
+  df %>%
+    mutate(PCR_result = factor(PCR_result, levels = c("Positive", "Negative"))) %>%
+    group_by(Participant_ID) %>%
+    arrange(PCR_result, Date) %>%
+    filter(row_number() == 1)
+}
+
+exposed_after <- function(PCR_data, from_dates, time_window) {
+  windows <- from_dates %>%
+    group_by(Household_ID) %>%
+    summarize(max_date = max(Date)) %>%
+    mutate(win = interval(max_date, as.Date(max_date) + time_window))
+  PCR_data %>%
+    left_join(windows, by = "Household_ID") %>%
+    filter(Date %within% win & !is.na(Participant_ID)) %>%
+    first_result_per_person() %>%
+    select(Household_ID, Participant_ID, PCR_result, Ct_val, Date)
+}
+
+run_cluster_round <- function(pos_data, pcr_data, demog, time_window, cluster_no, prev_end = NULL) {
+  pos_HH_data <- pos_data %>% left_join(demog, by = "Participant_ID") %>%
+    mutate(Household_ID = as.factor(Household_ID))
+  PCR_data <- pcr_data %>% left_join(demog, by = "Participant_ID") %>%
+    mutate(Household_ID = as.factor(Household_ID))
+
+  # 1. Index case(s): first positive in the household (after the previous cluster ended)
+  candidates <- pos_HH_data
+  if (!is.null(prev_end)) {
+    candidates <- candidates %>% left_join(prev_end, by = "Household_ID") %>%
+      filter(Date > cluster_end_date)
+  }
+  index_data <- candidates %>%
+    group_by(Household_ID) %>%
+    summarize(first_case_date = min(Date)) %>%
+    left_join(pos_HH_data, by = "Household_ID") %>%
+    filter(Date == first_case_date) %>%
+    mutate(first_end_date = as.Date(first_case_date) + time_window,
+           index_interval = interval(first_case_date, first_end_date)) %>%
+    select(Household_ID, first_case_date, Participant_ID, Ct_val, first_end_date, index_interval)
+
+  # 2. Primary exposures: tested within the index window (index cases removed)
+  primary <- PCR_data %>%
+    left_join(select(index_data, Household_ID, index_interval), by = "Household_ID") %>%
+    filter(Date %within% index_interval & !is.na(Participant_ID)) %>%
+    first_result_per_person() %>%
+    anti_join(index_data, by = "Participant_ID") %>%
+    select(Household_ID, Participant_ID, PCR_result, Ct_val, Date)
+
+  # 3. Secondary / tertiary exposures (used only to define the cluster end date)
+  secondary <- exposed_after(PCR_data, filter(primary, PCR_result == "Positive"), time_window)
+  tertiary  <- exposed_after(PCR_data, filter(secondary, PCR_result == "Positive"), time_window)
+  cluster_all <- bind_rows(primary, secondary, tertiary) %>% first_result_per_person()
+
+  # 4. Single-index clusters only
+  single_index <- index_data %>%
+    group_by(Household_ID) %>%
+    mutate(count = n_distinct(Participant_ID)) %>%
+    filter(count == 1) %>%
+    select(-count) %>%
+    mutate(Index_ID = Participant_ID, Date = first_case_date)
+
+  # 5. Cluster end date
+  all_pos <- pos_HH_data %>% select(Participant_ID, Household_ID, Date)
+  end_cluster <- cluster_all %>%
+    filter(PCR_result == "Positive") %>%
+    bind_rows(index_data %>% mutate(Date = first_case_date)) %>%
+    select(Household_ID, Participant_ID, Date) %>%
+    left_join(all_pos, by = c("Participant_ID", "Household_ID"), relationship = "many-to-many") %>%
+    arrange(Household_ID, Participant_ID, Date.y) %>%
+    group_by(Participant_ID) %>%
+    mutate(diff = difftime(Date.y, Date.x, units = "days")) %>%
+    filter(diff >= 0) %>%
+    mutate(days_since_last_positive = c(0, diff(as.numeric(Date.y))),
+           gap_exceeds_28_days = days_since_last_positive > EPISODE_WINDOW,
+           cluster_end_date = if_else(gap_exceeds_28_days, lag(Date.y), as.Date(max(Date.y)))) %>%
+    group_by(Participant_ID) %>%
+    filter(cluster_end_date == min(cluster_end_date, na.rm = TRUE)) %>%
+    group_by(Household_ID) %>%
+    summarize(cluster_end_date = max(cluster_end_date, na.rm = TRUE))
+
+  # 6. Index symptom status (symptomatic > missing > asymptomatic within 0-9 days)
+  index_symp <- PCR_data %>%
+    left_join(single_index, by = "Participant_ID") %>%
+    filter(!is.na(first_case_date)) %>%
+    mutate(date_diff = difftime(as.Date(Date.x), as.Date(first_case_date), units = "days")) %>%
+    filter(date_diff < SYMPTOM_WINDOW & date_diff >= 0, !is.na(Participant_ID)) %>%
+    mutate(symp = case_when(is.na(ili_symps_last_week) ~ "Missing",
+                            ili_symps_last_week == "Yes" ~ "1",
+                            TRUE ~ "0")) %>%
+    arrange(factor(symp, levels = c("1", "Missing", "0"))) %>%
+    group_by(Participant_ID) %>%
+    filter(row_number() == 1) %>%
+    select(Participant_ID, symp)
+
+  single_index <- single_index %>%
+    left_join(index_symp, by = "Participant_ID") %>%
+    select(Household_ID, Index_ID, Ct_val, symp, Date) %>%
+    rename(Index_date = Date)
+
+  # 7. Analysis data: one row per primary-exposed household member
+  cluster_sing_prim <- single_index %>%
+    left_join(primary, by = "Household_ID") %>%
+    select(-Ct_val.y) %>%
+    rename(Index_Ct = Ct_val.x) %>%
+    mutate(Cluster_no = cluster_no)
+
+  list(index_data = select(index_data, -index_interval),
+       end_cluster = end_cluster,
+       cluster_sing_prim = cluster_sing_prim)
+}
+
+run_clusters_for_virus <- function(pcr_col, input_tx, demog) {
+  pcr <- input_tx %>%
+    select(Participant_ID, Date, PCR_result = all_of(paste0(pcr_col, "_pcr")),
+           Ct_val = all_of(paste0(pcr_col, "_ct")), ili_symps_last_week)
+  pos <- pcr %>% filter(PCR_result == "Positive", !is.na(Date), !is.na(Participant_ID))
+
+  rounds <- vector("list", TX_MAX_ROUNDS)
+  prev_end <- NULL
+  for (k in seq_len(TX_MAX_ROUNDS)) {
+    rounds[[k]] <- run_cluster_round(pos, pcr, demog, TX_WINDOW, k, prev_end)
+    prev_end <- rounds[[k]]$end_cluster
+  }
+  if (nrow(rounds[[TX_MAX_ROUNDS]]$index_data) > 0) {
+    warning(pcr_col, ": clusters still found in round ", TX_MAX_ROUNDS, "; increase TX_MAX_ROUNDS")
+  }
+  rounds
+}
+```
+
+```{r run-clusters}
+input_tx <- input %>% rename(Participant_ID = pid, Date = date)
+
+cluster_results <- map(set_names(tx_lookup$tag),
+                       ~ run_clusters_for_virus(tx_lookup$pcr_col[tx_lookup$tag == .x], input_tx, full_demog_data))
+```
+
+## Cluster counts
+
+```{r cluster-counts}
+all_index_cases <- imap_dfr(cluster_results, function(rounds, tag) {
+  map_dfr(rounds, "index_data") %>% mutate(virus = tag)
+}) %>%
+  arrange(first_case_date, virus, Participant_ID) %>%
+  distinct(first_case_date, virus, Participant_ID, .keep_all = TRUE) %>%
+  group_by(Household_ID, virus, first_case_date) %>%
+  mutate(cluster_ID = cur_group_id(), count = n()) %>%
+  ungroup() %>%
+  mutate(single_index = count == 1)
+
+n_clusters        <- n_distinct(all_index_cases$cluster_ID)
+n_single          <- sum(all_index_cases$single_index)
+n_multi_clusters  <- n_distinct(all_index_cases$cluster_ID[!all_index_cases$single_index])
+n_coindex_cases   <- sum(!all_index_cases$single_index)
+
+add_result("Household clusters", n_clusters)
+add_result("Single-index clusters", n_single)
+add_result("Co-index clusters (co-index cases)", sprintf("%d (%d)", n_multi_clusters, n_coindex_cases))
+
+table(all_index_cases$virus, all_index_cases$single_index, dnn = c("virus", "single index"))
+show_results()
+```
+
+## Analysis dataset and index shedding duration
+
+Index cases are dropped from the exposed rows, and each row gets the index case's age. Index shedding (`longshed`) uses the main definition: "long" if the index's species-level episode containing the index date lasted more than 7 days (>1 week).
+
+```{r tx-analysis-data}
+index_age <- full_demog_data %>% select(Index_ID = Participant_ID, age_cat)
+
+combined_df <- imap_dfr(cluster_results, function(rounds, tag) {
+  map_dfr(rounds, "cluster_sing_prim") %>%
+    filter(Participant_ID != Index_ID) %>%
+    left_join(index_age, by = "Index_ID") %>%
+    mutate(tag = tag)
+}) %>%
+  left_join(tx_lookup, by = "tag") %>%
+  mutate(virus = tx_label) %>%
+  group_by(Household_ID, Index_date, virus, Index_ID) %>%
+  mutate(cluster_count = cur_group_id()) %>%
+  ungroup()
+
+# Index shedding duration from species-level episodes
+index_shedding <- combined_df %>%
+  distinct(cluster_count, Index_ID, Index_date, pcr_col) %>%
+  inner_join(viral_episodes_tx %>% select(pid, virus, start_date, end_date, duration),
+             by = c("Index_ID" = "pid", "pcr_col" = "virus"), relationship = "many-to-many") %>%
+  filter(Index_date >= start_date, Index_date <= end_date) %>%
+  distinct(cluster_count, .keep_all = TRUE) %>%
+  transmute(cluster_count, longshed = if_else(duration > LONG_SHED_DAYS, "long", "short"))  # >1 week
+
+combined_df <- combined_df %>%
+  left_join(index_shedding, by = "cluster_count") %>%
+  left_join(small_demog %>% select(Participant_ID = pid, Total_household_no), by = "Participant_ID") %>%
+  mutate(Total_household_no = cut_household(Total_household_no),
+         # days from contact's result to index date (negative = after index); used in Table S9
+         interval = as.numeric(difftime(Index_date, Date, units = "days")),
+         Outcome = case_when(PCR_result == "Positive" ~ 1, PCR_result == "Negative" ~ 0))
+
+add_result("Single-index clusters with >=1 exposed contact", n_distinct(combined_df$cluster_count))
+show_results()
+```
+
+## Overall secondary attack rate
+
+```{r sar-overall}
+cluster_sar <- combined_df %>%
+  group_by(cluster_count) %>%
+  summarize(num_exposed = n(),
+            num_positive = sum(PCR_result == "Positive", na.rm = TRUE),
+            prop_positive = num_positive / num_exposed)
+
+pooled <- binom.test(sum(cluster_sar$num_positive), sum(cluster_sar$num_exposed))
+
+add_result("Exposed per cluster, median (IQR; range)", sprintf("%g (%g - %g; %g - %g)", median(cluster_sar$num_exposed),
+              quantile(cluster_sar$num_exposed, .25), quantile(cluster_sar$num_exposed, .75),
+              min(cluster_sar$num_exposed), max(cluster_sar$num_exposed)))
+add_result("Clusters with transmission (%)", sprintf("%d (%.0f)", sum(cluster_sar$num_positive > 0), 100 * mean(cluster_sar$num_positive > 0)))
+add_result("Pooled SAR % (95% CI)", fmt_est_ci(100 * pooled$estimate, 100 * pooled$conf.int[1], 100 * pooled$conf.int[2], 1))
+add_result("Mean of cluster SARs %", sprintf("%.1f", 100 * mean(cluster_sar$prop_positive)))
+add_result("Cluster SAR median (IQR), max %", sprintf("%.0f (%.0f - %.0f), %.0f", 100 * median(cluster_sar$prop_positive),
+              100 * quantile(cluster_sar$prop_positive, .25), 100 * quantile(cluster_sar$prop_positive, .75),
+              100 * max(cluster_sar$prop_positive)))
+show_results()
+```
+
+## Factors associated with transmission (Table 4)
+
+There are two mixed-effects logistic models, each with a household random intercept. Shedding and symptom status may lie on the causal path from virus to transmission, so they go in a separate model from virus:
+
+* **Virus model:** virus + index age + index Ct + household size
+* **Symptom/shedding model:** symptoms + shedding + index age + index Ct + household size
+
+Both models use rows with complete data on *all* predictors, as in the original code.
+
+```{r tx-model-fns}
+set_tx_refs <- function(d) {
+  d %>% mutate(symp = relevel(as.factor(symp), ref = "0"),
+               age_cat = relevel(as.factor(age_cat), ref = "18-49"),
+               virus = relevel(as.factor(virus), ref = "HRV"),
+               longshed = relevel(as.factor(longshed), ref = "short"),
+               Total_household_no = relevel(as.factor(Total_household_no), ref = "5-7"))
+}
+
+run_tx_model <- function(predictors, data) {
+  ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+  data <- data %>% filter(if_all(all_of(predictors), ~ !is.na(.x)))
+  f <- function(p) as.formula(paste("Outcome ~", paste(p, collapse = " + "), "+ (1 | Household_ID)"))
+  full <- glmer_safe(f(predictors), family = binomial(link = "logit"), data = data, control = ctrl)
+  zero_terms <- unlist(map(predictors, function(p) {
+    if (!is.factor(data[[p]])) return(character())
+    ev <- tapply(data$Outcome, data[[p]], sum)
+    paste0(p, names(ev)[ev == 0])
+  }))
+  ors <- fixef_ci(full, zero_event_terms = zero_terms) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(predictor = str_extract(term, paste(predictors, collapse = "|")),
+           level = str_remove(term, paste0("^", predictor)),
+           level = if_else(level == "", predictor, level),
+           OR_CI = fmt_est_ci(estimate, conf.low, conf.high))
+  lrt <- map_dfr(predictors, function(p) {
+    red <- glmer_safe(f(setdiff(predictors, p)), family = binomial(link = "logit"), data = data, control = ctrl)
+    tibble(predictor = p, lr_pvalue = lrtest(full, red)[2, 5])
+  })
+  list(model = full, data = data, table = left_join(ors, lrt, by = "predictor"))
+}
+
+tx_summary_counts <- function(data, predictors) {
+  map_dfr(predictors, function(p) {
+    data %>% group_by(level = as.character(.data[[p]])) %>%
+      summarize(clusters = n_distinct(Household_ID, Index_date, Index_ID),
+                exposed = n(), secondary = sum(Outcome, na.rm = TRUE), .groups = "drop") %>%
+      mutate(predictor = p, `Secondary cases (%)` = sprintf("%d (%.1f%%)", secondary, 100 * secondary / exposed))
+  })
+}
+
+build_tx_table <- function(data, virus_preds, symptom_preds) {
+  all_preds <- union(virus_preds, symptom_preds)
+  data <- data %>% filter(!is.na(PCR_result)) %>% set_tx_refs()
+  data_complete <- data %>% filter(if_all(all_of(all_preds), ~ !is.na(.x)))
+  vm <- run_tx_model(virus_preds, data_complete)
+  sm <- run_tx_model(symptom_preds, data_complete)
+  ors <- bind_rows(vm$table %>% mutate(model = "Virus model"),
+                   sm$table %>% filter(predictor %in% c("symp", "longshed")) %>% mutate(model = "Symptom/shedding model"))
+  counts <- tx_summary_counts(data, setdiff(all_preds, "Index_Ct"))
+  tab <- counts %>%
+    full_join(ors %>% select(predictor, level, OR_CI, lr_pvalue, model), by = c("predictor", "level")) %>%
+    mutate(OR_CI = if_else(is.na(OR_CI) & !is.na(exposed), "ref", OR_CI),
+           OR_CI = if_else(!is.na(secondary) & secondary == 0 & OR_CI != "ref", "N/A", OR_CI)) %>%
+    group_by(predictor) %>%
+    mutate(`P-value` = if_else(row_number() == n(), fmt_p(max(lr_pvalue, na.rm = TRUE)), "")) %>%
+    ungroup() %>%
+    mutate(Level = case_when(predictor == "symp" & level == "0" ~ "Asymptomatic",
+                             predictor == "symp" & level == "1" ~ "Symptomatic",
+                             predictor == "longshed" & level == "short" ~ "1-week",
+                             predictor == "longshed" & level == "long" ~ ">1-week",
+                             TRUE ~ level),
+           Variable = recode(predictor, symp = "Symptoms", age_cat = "Age", virus = "Virus",
+                             longshed = "Shedding", Index_Ct = "Index Ct",
+                             Total_household_no = "Household size")) %>%
+    select(Variable, Level, Clusters = clusters, Exposed = exposed,
+           `Secondary cases (%)`, `aOR (95% CI)` = OR_CI, `P-value`, model)
+  list(table = tab, virus_model = vm, symptom_model = sm, data = data_complete)
+}
+```
+
+```{r table-4}
+table4 <- build_tx_table(combined_df,
+                         virus_preds   = c("virus", "age_cat", "Index_Ct", "Total_household_no"),
+                         symptom_preds = c("symp", "longshed", "age_cat", "Index_Ct", "Total_household_no"))
+table4$table
+write.csv(table4$table, file.path(out_dir, "Table4_transmission.csv"), row.names = FALSE)
+
+t4 <- table4$table
+```
+
+
+
+```{r tx-interactions}
+d <- table4$data
+ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+base_v  <- glmer_safe(Outcome ~ virus + age_cat + Index_Ct + symp + (1 | Household_ID), data = d, family = binomial, control = ctrl)
+int_age <- glmer_safe(Outcome ~ virus * age_cat + Index_Ct + symp + (1 | Household_ID), data = d, family = binomial, control = ctrl)
+int_sym <- glmer_safe(Outcome ~ age_cat + virus * symp + Index_Ct + (1 | Household_ID), data = d, family = binomial, control = ctrl)
+tibble(test = c("virus x index age", "virus x index symptoms"),
+       p = fmt_p(c(lrtest(base_v, int_age)[2, 5], lrtest(base_v, int_sym)[2, 5])))
+```
+
+## Secondary attack rate by virus (Figure 2B)
+
+ Pooled SAR per virus with exact binomial 95% CIs. RSV B, PIV 4 and influenza B are excluded, as in the figure.
+
+```{r figure-2b, fig.height = 5, fig.width = 8}
+# Pooled SAR per virus (secondary cases / exposed contacts), exact binomial 95% CI
+sar_results <- combined_df %>%
+  filter(!is.na(Outcome), virus != "Parainfluenza 4") %>%   # PIV4: 1 cluster, excluded as in legend
+  group_by(virus) %>%
+  summarise(num_clusters = n_distinct(cluster_count),
+            exposed = n(), secondary = sum(Outcome), .groups = "drop") %>%
+  mutate(sar = secondary / exposed,
+         ci_lower = map2_dbl(secondary, exposed, ~ binom.test(.x, .y)$conf.int[1]),
+         ci_upper = map2_dbl(secondary, exposed, ~ binom.test(.x, .y)$conf.int[2])) %>%
+  arrange(desc(num_clusters)) %>%
+  mutate(virus = factor(virus, levels = virus))
+sar_results
+
+# Virus LRT p-value from the Table 4 virus model
+virus_p <- table4$virus_model$table %>% filter(predictor == "virus") %>% pull(lr_pvalue) %>% first()
+virus_p_label <- if (virus_p < 0.0001) "p<0.0001" else paste0("p = ", fmt_p(virus_p))
+
+# Species-level colours, matched to the pooled-virus palette
+color_vector_split <- c("HRV" = "#00A9FF", "Seasonal CoV" = "#CD9600", "SARS-CoV-2" = "#7CAE00",
+                        "RSV" = "#FF61CC", "Parainfluenza 1" = "#C77CFF", "Parainfluenza 2" = "#A35BD9",
+                        "Parainfluenza 3" = "#7F3DB3", "Adenovirus" = "#F8766D", "HMPV" = "#00BFC4",
+                        "Influenza A" = "#00BE67")
+
+sar_plot <- ggplot(sar_results, aes(x = virus, y = sar * 100, color = virus)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = ci_lower * 100, ymax = ci_upper * 100), width = 0.2) +
+  geom_text(aes(label = paste("n =", num_clusters), y = ci_upper * 100 + 0.6),
+            vjust = 0, size = label_size, color = "grey") +
+  annotate("text", x = Inf, y = Inf, label = virus_p_label,
+           hjust = 1, vjust = 1, size = label_size, fontface = "italic") +
+  labs(x = "Virus", y = "Secondary Attack Rate (%)") +
+  scale_color_manual(values = color_vector_split, guide = "none") +
+  coord_cartesian(ylim = c(0, 12.5), clip = "off") +
+  shared_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+sar_plot
+ggsave(file.path(out_dir, "Figure2B_SAR_by_virus.png"), sar_plot, width = 8, height = 5, dpi = 600)
+```
+
+
+
+## Sensitivity analysis: 2-day delay (Table S9)
+
+Exposed contacts whose result was 1 or 2 days after the index date are excluded, since these may be community acquisition. Household size isn't in these models, matching Table S9.
+
+
+```{r table-s9}
+combined_df_2day <- combined_df %>% filter(!interval %in% c(-1, -2))
+table_s9 <- build_tx_table(combined_df_2day,
+                           virus_preds   = c("virus", "age_cat", "Index_Ct"),
+                           symptom_preds = c("symp", "longshed", "age_cat", "Index_Ct"))
+table_s9$table
+write.csv(table_s9$table, file.path(out_dir, "TableS9_transmission_2day.csv"), row.names = FALSE)
+
+s9 <- table_s9$table
+```
+
+## Virus-specific risk factors for transmission (Table S10)
+
+For each virus with enough clusters, these are univariable household random-intercept models for index age, symptoms and Ct.
+
+
+```{r table-s10}
+s10_viruses <- c("HRV", "SARS-CoV-2", "RSV", "Seasonal CoV", "Parainfluenza 1",
+                 "Parainfluenza 2", "Parainfluenza 3", "Influenza A")
+s10_preds <- c("symp", "age_cat", "Index_Ct")
+ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+
+table_s10 <- map_dfr(s10_viruses, function(v) {
+  d <- combined_df %>%
+    filter(virus == v, !is.na(Outcome)) %>%
+    mutate(age_cat = relevel(factor(age_cat, levels = c("18-49", "<5", "5-17", ">50")), ref = "18-49"),
+           symp = factor(symp, levels = c("0", "1", "Missing"), labels = c("Asymptomatic", "Symptomatic", "Missing")))
+  total_clusters <- n_distinct(d$cluster_count); total_exposed <- nrow(d)
+
+  counts <- bind_rows(
+    d %>% group_by(Level = as.character(age_cat)) %>% summarise(i = n_distinct(cluster_count), e = n(), s = sum(Outcome)) %>% mutate(predictor = "age_cat"),
+    d %>% group_by(Level = as.character(symp)) %>% summarise(i = n_distinct(cluster_count), e = n(), s = sum(Outcome)) %>% mutate(predictor = "symp"),
+    d %>% summarise(i = n_distinct(cluster_count), e = n(), s = sum(Outcome)) %>% mutate(Level = "Index_Ct", predictor = "Index_Ct")
+  ) %>%
+    mutate(`Index cases (%)` = sprintf("%d (%.1f%%)", i, 100 * i / total_clusters),
+           `Exposed (%)` = sprintf("%d (%.1f%%)", e, 100 * e / total_exposed),
+           `Secondary cases (%)` = sprintf("%d (%.1f%%)", s, 100 * s / e))
+
+  ors <- map_dfr(s10_preds, function(p) {
+    dd <- d %>% filter(!is.na(.data[[p]]))
+    mod <- tryCatch(glmer_safe(as.formula(paste("Outcome ~", p, "+ (1 | Household_ID)")), family = binomial, data = dd, control = ctrl),
+                    error = function(e) NULL)
+    if (is.null(mod)) return(tibble(predictor = p))
+    nul <- glmer_safe(Outcome ~ (1 | Household_ID), family = binomial, data = dd, control = ctrl)
+    fixef_ci(mod) %>%
+      filter(term != "(Intercept)") %>%
+      transmute(predictor = p, Level = if (p == "Index_Ct") "Index_Ct" else str_remove(term, p),
+                `OR (95% CI)` = fmt_est_ci(estimate, conf.low, conf.high),
+                p_value = fmt_p(lrtest(mod, nul)[2, 5]))
+  })
+
+  counts %>% left_join(ors, by = c("predictor", "Level")) %>%
+    mutate(Virus = v, `OR (95% CI)` = replace_na(`OR (95% CI)`, "ref")) %>%
+    select(Virus, Variable = predictor, Level, `Index cases (%)`, `Exposed (%)`, `Secondary cases (%)`, `OR (95% CI)`, p_value)
+})
+table_s10
+write.csv(table_s10, file.path(out_dir, "TableS10_transmission_by_virus.csv"), row.names = FALSE)
+```
+
